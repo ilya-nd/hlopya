@@ -144,9 +144,9 @@ struct SettingsView: View {
                         .foregroundStyle(.orange)
                 }
                 Picker("Claude Model", selection: $claudeModel) {
-                    Text("Sonnet 4.6").tag("sonnet")
-                    Text("Opus 4.6").tag("opus")
-                    Text("Haiku 4.5").tag("haiku")
+                    Text("Sonnet latest").tag("sonnet")
+                    Text("Opus latest").tag("opus")
+                    Text("Haiku latest").tag("haiku")
                 }
                 Text("Model used for generating meeting notes and summaries")
                     .font(HlopTypography.footnote)

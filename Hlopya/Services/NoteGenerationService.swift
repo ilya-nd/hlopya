@@ -5,7 +5,9 @@ import Foundation
 final class NoteGenerationService {
 
     var model: String {
-        UserDefaults.standard.string(forKey: "claudeModel").flatMap { $0.isEmpty ? nil : $0 } ?? "sonnet"
+        let raw = UserDefaults.standard.string(forKey: "claudeModel")
+            .flatMap { $0.isEmpty ? nil : $0 } ?? "sonnet"
+        return Self.normalizeClaudeModel(raw)
     }
 
     /// Generate notes from a transcript using `claude -p`
@@ -24,7 +26,12 @@ final class NoteGenerationService {
         // Run claude -p
         let process = Process()
         process.executableURL = URL(fileURLWithPath: claudePath)
-        process.arguments = ["-p", "--model", model, "--output-format", "text"]
+        process.arguments = [
+            "-p",
+            "--model", model,
+            "--output-format", "text",
+            "--no-session-persistence"
+        ]
 
         // Fix environment for GUI-launched app:
         // - Remove CLAUDECODE to avoid nested session error
@@ -100,6 +107,23 @@ final class NoteGenerationService {
         if !path.isEmpty { return path }
 
         return "claude"  // Hope it's in PATH
+    }
+
+    static func normalizeClaudeModel(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+
+        if lower == "sonnet" || lower.hasPrefix("claude-sonnet-") {
+            return "sonnet"
+        }
+        if lower == "opus" || lower.hasPrefix("claude-opus-") {
+            return "opus"
+        }
+        if lower == "haiku" || lower.hasPrefix("claude-haiku-") {
+            return "haiku"
+        }
+
+        return trimmed.isEmpty ? "sonnet" : trimmed
     }
 
     private func parseResponse(_ text: String, transcript: TranscriptResult) -> MeetingNotes {
