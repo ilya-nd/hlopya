@@ -203,14 +203,31 @@ final class SystemAudioTap {
         }
         NSLog("[SystemAudioTap] Created aggregate device #%d", aggregateDeviceID)
 
-        // 5. Set up AVAudioConverter for high-quality resampling
-        let channels = max(Int(format.mChannelsPerFrame), 1)
+        // 5. Set up AVAudioConverter for high-quality resampling.
+        // Sample TYPE (float vs int) comes from the tap's advertised format — that part is
+        // reliable. Channel COUNT and interleaving are derived per-callback from the actual
+        // buffer list instead (see processAudio): an aggregate device can re-lay-out the tap's
+        // audio, and trusting the advertised channel/interleave flags is what made system.wav
+        // come out at exactly half length.
         let isFloat = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-        let isNonInterleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
 
-        // Build an AVAudioFormat matching the tap's native format
-        // We'll mix to mono float first, then let the converter handle resampling + int16 conversion
-        let monoFloatInput = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: format.mSampleRate, channels: 1, interleaved: true)!
+        // Authoritative input rate = the aggregate device's real operating rate. The IO proc
+        // delivers frames at THIS rate; the tap's advertised rate can differ, and using a wrong
+        // rate time-compresses the channel (the other way to end up with a half-length file).
+        var inputRate = format.mSampleRate
+        var nominalRate = Float64(0)
+        var nominalSize = UInt32(MemoryLayout<Float64>.size)
+        var nominalAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioObjectGetPropertyData(aggregateDeviceID, &nominalAddr, 0, nil, &nominalSize, &nominalRate) == noErr, nominalRate > 0 {
+            inputRate = nominalRate
+        }
+
+        // Mix to mono float first, then let the converter handle resampling + int16 conversion
+        let monoFloatInput = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: inputRate, channels: 1, interleaved: true)!
         let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(targetRate), channels: 1, interleaved: true)!
         guard let conv = AVAudioConverter(from: monoFloatInput, to: outFmt) else {
             throw AudioCaptureError.systemAudioFailed("Failed to create audio converter")
@@ -219,8 +236,8 @@ final class SystemAudioTap {
         self.converter = conv
         self.inputFormat = monoFloatInput
 
-        NSLog("[SystemAudioTap] Float=%d, NonInterleaved=%d, channels=%d, converter: %.0f Hz -> %.0f Hz",
-              isFloat ? 1 : 0, isNonInterleaved ? 1 : 0, channels, format.mSampleRate, Double(targetRate))
+        NSLog("[SystemAudioTap] isFloat=%d, tapFormat=%.0f Hz/%d ch, deviceRate=%.0f Hz, converter -> %.0f Hz",
+              isFloat ? 1 : 0, format.mSampleRate, format.mChannelsPerFrame, inputRate, Double(targetRate))
 
         // 6. Start audio I/O
         err = AudioDeviceCreateIOProcIDWithBlock(&deviceProcID, aggregateDeviceID, queue) {
@@ -230,8 +247,7 @@ final class SystemAudioTap {
             let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
             guard !abl.isEmpty else { return }
 
-            self.processAudio(abl: abl, channels: channels,
-                              isFloat: isFloat, isNonInterleaved: isNonInterleaved)
+            self.processAudio(abl: abl, isFloat: isFloat)
         }
         guard err == noErr else {
             throw AudioCaptureError.systemAudioFailed("IO proc creation failed (error \(err))")
@@ -257,63 +273,72 @@ final class SystemAudioTap {
 
     // MARK: - Audio Processing (AVAudioConverter-based with buffering)
 
-    private func processAudio(abl: UnsafeMutableAudioBufferListPointer,
-                               channels: Int,
-                               isFloat: Bool,
-                               isNonInterleaved: Bool) {
-        // Step 1: Extract mono float samples from the raw buffer
-        let frameCount: Int
-        let monoFloats: UnsafeMutablePointer<Float>
+    private func processAudio(abl: UnsafeMutableAudioBufferListPointer, isFloat: Bool) {
+        guard let firstData = abl[0].mData else { return }
+
+        // Derive channel layout from the ACTUAL buffer list — this is the authoritative
+        // description of what is really in memory. The previous code trusted the tap's
+        // advertised format flags, but an aggregate device can hand the IO proc a different
+        // layout (interleaved vs not, different channel count). When the advertised layout
+        // disagreed with reality the frame count came out 2x off, so system.wav was written
+        // at exactly half length. Buffer count + mNumberChannels never lie.
+        let numBuffers = abl.count
+        let nonInterleaved = numBuffers > 1
+        let bufChannels = max(Int(abl[0].mNumberChannels), 1)
+        let bytesPerSample = isFloat ? MemoryLayout<Float>.size : MemoryLayout<Int16>.size
+        let frameCount = nonInterleaved
+            ? Int(abl[0].mDataByteSize) / bytesPerSample
+            : Int(abl[0].mDataByteSize) / (bytesPerSample * bufChannels)
+        guard frameCount > 0 else { return }
+
+        if callbackCount == 0 {
+            NSLog("[SystemAudioTap] First buffer: numBuffers=%d, mNumberChannels=%d, bytes=%d, frames=%d, nonInterleaved=%d, isFloat=%d, inputRate=%.0f",
+                  numBuffers, Int(abl[0].mNumberChannels), Int(abl[0].mDataByteSize), frameCount,
+                  nonInterleaved ? 1 : 0, isFloat ? 1 : 0, inputFormat?.sampleRate ?? 0)
+        }
+
+        // Step 1: Extract / mix to mono float
+        let monoFloats = UnsafeMutablePointer<Float>.allocate(capacity: frameCount)
+        defer { monoFloats.deallocate() }
 
         if isFloat {
-            if isNonInterleaved {
-                guard let ch0Data = abl[0].mData else { return }
-                let ch0 = ch0Data.assumingMemoryBound(to: Float.self)
-                frameCount = Int(abl[0].mDataByteSize) / MemoryLayout<Float>.size
-                guard frameCount > 0 else { return }
-
-                monoFloats = .allocate(capacity: frameCount)
-                if channels >= 2 && abl.count > 1, let ch1Data = abl[1].mData {
+            if nonInterleaved {
+                let ch0 = firstData.assumingMemoryBound(to: Float.self)
+                if numBuffers >= 2, let ch1Data = abl[1].mData {
                     let ch1 = ch1Data.assumingMemoryBound(to: Float.self)
                     for i in 0..<frameCount { monoFloats[i] = (ch0[i] + ch1[i]) * 0.5 }
                 } else {
                     for i in 0..<frameCount { monoFloats[i] = ch0[i] }
                 }
             } else {
-                guard let data = abl[0].mData else { return }
-                let floats = data.assumingMemoryBound(to: Float.self)
-                frameCount = Int(abl[0].mDataByteSize) / (MemoryLayout<Float>.size * channels)
-                guard frameCount > 0 else { return }
-
-                monoFloats = .allocate(capacity: frameCount)
-                if channels >= 2 {
-                    for i in 0..<frameCount { monoFloats[i] = (floats[i * channels] + floats[i * channels + 1]) * 0.5 }
+                let floats = firstData.assumingMemoryBound(to: Float.self)
+                if bufChannels >= 2 {
+                    for i in 0..<frameCount { monoFloats[i] = (floats[i * bufChannels] + floats[i * bufChannels + 1]) * 0.5 }
                 } else {
                     for i in 0..<frameCount { monoFloats[i] = floats[i] }
                 }
             }
         } else {
-            guard let data = abl[0].mData else { return }
-            let samples = data.assumingMemoryBound(to: Int16.self)
-            let sampleCount = Int(abl[0].mDataByteSize) / MemoryLayout<Int16>.size
-            frameCount = isNonInterleaved ? sampleCount : sampleCount / channels
-            guard frameCount > 0 else { return }
-
-            monoFloats = .allocate(capacity: frameCount)
-            if isNonInterleaved || channels == 1 {
-                for i in 0..<frameCount { monoFloats[i] = Float(samples[i]) / 32768.0 }
+            if nonInterleaved {
+                let ch0 = firstData.assumingMemoryBound(to: Int16.self)
+                if numBuffers >= 2, let ch1Data = abl[1].mData {
+                    let ch1 = ch1Data.assumingMemoryBound(to: Int16.self)
+                    for i in 0..<frameCount { monoFloats[i] = (Float(ch0[i]) + Float(ch1[i])) / 65536.0 }
+                } else {
+                    for i in 0..<frameCount { monoFloats[i] = Float(ch0[i]) / 32768.0 }
+                }
             } else {
-                for i in 0..<frameCount {
-                    let l = Float(samples[i * channels]) / 32768.0
-                    let r = Float(samples[i * channels + 1]) / 32768.0
-                    monoFloats[i] = (l + r) * 0.5
+                let samples = firstData.assumingMemoryBound(to: Int16.self)
+                if bufChannels >= 2 {
+                    for i in 0..<frameCount { monoFloats[i] = (Float(samples[i * bufChannels]) + Float(samples[i * bufChannels + 1])) / 65536.0 }
+                } else {
+                    for i in 0..<frameCount { monoFloats[i] = Float(samples[i]) / 32768.0 }
                 }
             }
         }
 
         // Step 2: Accumulate into pending buffer (avoids converter boundary glitches on small chunks)
         pendingSamples.append(contentsOf: UnsafeBufferPointer(start: monoFloats, count: frameCount))
-        monoFloats.deallocate()
 
         callbackCount += 1
         totalSamplesReceived += frameCount
